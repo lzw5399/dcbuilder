@@ -211,22 +211,15 @@ jobs:
           NODE
 
           mkdir -p "$source_root"
-          tar -xzf "$source_archive" -C "$source_root"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            tar --force-local -xzf "${source_archive//\\//}" -C "${source_root//\\//}"
+          else
+            tar -xzf "$source_archive" -C "$source_root"
+          fi
 
           {
             echo "source_root=${source_root}"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Delete source bundle from COS
-        if: always() && steps.source_keys.outputs.source_key != ''
-        env:
-          TENCENT_COS_BUCKET: ${{ vars.TENCENT_COS_BUCKET || secrets.TENCENT_COS_BUCKET }}
-          SOURCE_KEY: ${{ steps.source_keys.outputs.source_key }}
-          SOURCE_SHA_KEY: ${{ steps.source_keys.outputs.source_sha_key }}
-        run: |
-          set +e
-          coscli rm "cos://${TENCENT_COS_BUCKET}/${SOURCE_KEY}" -c "$COSCLI_CONFIG_PATH"
-          coscli rm "cos://${TENCENT_COS_BUCKET}/${SOURCE_SHA_KEY}" -c "$COSCLI_CONFIG_PATH"
 
       - name: Set up Node.js
         uses: actions/setup-node@v6.4.0
@@ -450,3 +443,82 @@ jobs:
             process.exit(1);
           });
           NODE
+
+  cleanup:
+    name: Delete source bundles from COS
+    needs: make
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_PREFIX: ${{ github.event.client_payload.source.prefix }}
+      SOURCE_ARCHIVE_NAME: ${{ github.event.client_payload.source.archiveName }}
+      SOURCE_SHA_NAME: ${{ github.event.client_payload.source.shaName }}
+    steps:
+      - name: Set up COSCLI
+        env:
+          TENCENT_COS_SECRET_ID: ${{ secrets.TENCENT_COS_SECRET_ID }}
+          TENCENT_COS_SECRET_KEY: ${{ secrets.TENCENT_COS_SECRET_KEY }}
+          TENCENT_COS_SECURITY_TOKEN: ${{ secrets.TENCENT_COS_SECURITY_TOKEN }}
+          TENCENT_COS_BUCKET: ${{ vars.TENCENT_COS_BUCKET || secrets.TENCENT_COS_BUCKET }}
+          TENCENT_COS_REGION: ${{ vars.TENCENT_COS_REGION || secrets.TENCENT_COS_REGION }}
+        run: |
+          set -euo pipefail
+
+          for name in TENCENT_COS_SECRET_ID TENCENT_COS_SECRET_KEY TENCENT_COS_BUCKET TENCENT_COS_REGION; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::${name} must be configured."
+              exit 1
+            fi
+          done
+
+          install_dir="${RUNNER_TEMP}/coscli"
+          mkdir -p "$install_dir"
+          coscli_bin="${install_dir}/coscli"
+
+          curl --fail --location --show-error --silent \
+            "https://cosbrowser.cloud.tencent.com/software/coscli/coscli-linux-amd64" \
+            --output "$coscli_bin"
+          chmod +x "$coscli_bin"
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const configPath = path.join(process.env.RUNNER_TEMP, 'coscli-release.yaml');
+          const yamlString = (value) => JSON.stringify(value || '');
+          const config = [
+            'cos:',
+            '  base:',
+            `    secretid: ${yamlString(process.env.TENCENT_COS_SECRET_ID)}`,
+            `    secretkey: ${yamlString(process.env.TENCENT_COS_SECRET_KEY)}`,
+            `    sessiontoken: ${yamlString(process.env.TENCENT_COS_SECURITY_TOKEN)}`,
+            '    protocol: https',
+            '  buckets:',
+            `  - name: ${yamlString(process.env.TENCENT_COS_BUCKET)}`,
+            '    alias: release',
+            `    region: ${yamlString(process.env.TENCENT_COS_REGION)}`,
+            `    endpoint: ${yamlString(`cos.${process.env.TENCENT_COS_REGION}.myqcloud.com`)}`,
+            '    ofs: false',
+            '',
+          ].join('\n');
+
+          fs.writeFileSync(configPath, config);
+          fs.appendFileSync(process.env.GITHUB_ENV, `COSCLI_CONFIG_PATH=${configPath}\n`);
+          NODE
+
+      - name: Delete temporary source bundles
+        env:
+          TENCENT_COS_BUCKET: ${{ vars.TENCENT_COS_BUCKET || secrets.TENCENT_COS_BUCKET }}
+        run: |
+          set +e
+
+          status=0
+          for target in windows-x64 mac-arm64 mac-x64; do
+            archive_key="${SOURCE_PREFIX}/${target}/${SOURCE_ARCHIVE_NAME}"
+            sha_key="${SOURCE_PREFIX}/${target}/${SOURCE_SHA_NAME}"
+            coscli rm "cos://${TENCENT_COS_BUCKET}/${archive_key}" -c "$COSCLI_CONFIG_PATH" || status=1
+            coscli rm "cos://${TENCENT_COS_BUCKET}/${sha_key}" -c "$COSCLI_CONFIG_PATH" || status=1
+          done
+
+          exit "$status"
