@@ -1,0 +1,452 @@
+name: Desktop Package Builder
+
+on:
+  repository_dispatch:
+    types:
+      - desktop-package
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-package-${{ github.event.client_payload.sha }}-${{ github.event.client_payload.version }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  make:
+    name: Make ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2022
+            platform: win32
+            arch: x64
+          - name: mac-arm64
+            os: macos-15
+            platform: darwin
+            arch: arm64
+          - name: mac-x64
+            os: macos-15-intel
+            platform: darwin
+            arch: x64
+    env:
+      CHANNEL: ${{ github.event.client_payload.channel }}
+      VERSION: ${{ github.event.client_payload.version }}
+      SOURCE_PREFIX: ${{ github.event.client_payload.sourcePrefix }}
+      SOURCE_ARCHIVE_NAME: ${{ github.event.client_payload.sourceArchiveName }}
+      SOURCE_SHA_NAME: ${{ github.event.client_payload.sourceShaName }}
+      EXPECTED_SOURCE_SHA256: ${{ github.event.client_payload.sourceSha256 }}
+      SOURCE_REPOSITORY: ${{ github.event.client_payload.sourceRepository }}
+      SOURCE_RUN_ID: ${{ github.event.client_payload.runId }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.client_payload.runAttempt }}
+      SOURCE_RUN_URL: ${{ github.event.client_payload.runUrl }}
+      SOURCE_SHA: ${{ github.event.client_payload.sha }}
+      SOURCE_REF_NAME: ${{ github.event.client_payload.refName }}
+      PACKAGE_FILE_PREFIX: ${{ github.event.client_payload.packageFilePrefix || 'desktop-app' }}
+    steps:
+      - name: Validate dispatch payload
+        run: |
+          set -euo pipefail
+
+          node - <<'NODE'
+          const env = process.env;
+          const required = [
+            'CHANNEL',
+            'VERSION',
+            'SOURCE_PREFIX',
+            'SOURCE_ARCHIVE_NAME',
+            'SOURCE_SHA_NAME',
+            'EXPECTED_SOURCE_SHA256',
+            'SOURCE_SHA',
+            'SOURCE_REF_NAME',
+            'SOURCE_REPOSITORY',
+            'SOURCE_RUN_ID',
+            'SOURCE_RUN_ATTEMPT',
+            'SOURCE_RUN_URL',
+          ];
+          const missing = required.filter((name) => !env[name]);
+          if (missing.length > 0) {
+            throw new Error(`Missing dispatch payload fields: ${missing.join(', ')}`);
+          }
+          if (!['test', 'prod'].includes(env.CHANNEL)) {
+            throw new Error('Invalid release channel');
+          }
+          if (!/^_builder-sources\/[0-9a-f]{40}\/[0-9a-f]{32}$/.test(env.SOURCE_PREFIX)) {
+            throw new Error('Invalid source prefix');
+          }
+          if (env.SOURCE_ARCHIVE_NAME !== 'desktop-source.tgz' || env.SOURCE_SHA_NAME !== 'desktop-source.sha256') {
+            throw new Error('Invalid source bundle file names');
+          }
+          if (!/^[a-f0-9]{64}$/.test(env.EXPECTED_SOURCE_SHA256)) {
+            throw new Error('Invalid source sha256');
+          }
+          if (!/^[A-Za-z0-9._-]+$/.test(env.PACKAGE_FILE_PREFIX)) {
+            throw new Error('Invalid package file prefix');
+          }
+          NODE
+
+      - name: Set up COSCLI
+        env:
+          TENCENT_COS_SECRET_ID: ${{ secrets.TENCENT_COS_SECRET_ID }}
+          TENCENT_COS_SECRET_KEY: ${{ secrets.TENCENT_COS_SECRET_KEY }}
+          TENCENT_COS_SECURITY_TOKEN: ${{ secrets.TENCENT_COS_SECURITY_TOKEN }}
+          TENCENT_COS_BUCKET: ${{ vars.TENCENT_COS_BUCKET || secrets.TENCENT_COS_BUCKET }}
+          TENCENT_COS_REGION: ${{ vars.TENCENT_COS_REGION || secrets.TENCENT_COS_REGION }}
+        run: |
+          set -euo pipefail
+
+          for name in TENCENT_COS_SECRET_ID TENCENT_COS_SECRET_KEY TENCENT_COS_BUCKET TENCENT_COS_REGION; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::${name} must be configured."
+              exit 1
+            fi
+          done
+
+          install_dir="${RUNNER_TEMP}/coscli"
+          mkdir -p "$install_dir"
+
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Windows-X64)
+              coscli_url="https://cosbrowser.cloud.tencent.com/software/coscli/coscli-windows.exe"
+              coscli_bin="${install_dir}/coscli.exe"
+              ;;
+            macOS-ARM64)
+              coscli_url="https://cosbrowser.cloud.tencent.com/software/coscli/coscli-darwin-arm64"
+              coscli_bin="${install_dir}/coscli"
+              ;;
+            macOS-X64)
+              coscli_url="https://cosbrowser.cloud.tencent.com/software/coscli/coscli-darwin-amd64"
+              coscli_bin="${install_dir}/coscli"
+              ;;
+            Linux-X64)
+              coscli_url="https://cosbrowser.cloud.tencent.com/software/coscli/coscli-linux-amd64"
+              coscli_bin="${install_dir}/coscli"
+              ;;
+            *)
+              echo "::error::Unsupported COSCLI runner: ${RUNNER_OS}-${RUNNER_ARCH}."
+              exit 1
+              ;;
+          esac
+
+          curl --fail --location --show-error --silent "$coscli_url" --output "$coscli_bin"
+          chmod +x "$coscli_bin"
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const configPath = path.join(process.env.RUNNER_TEMP, 'coscli-release.yaml');
+          const yamlString = (value) => JSON.stringify(value || '');
+          const config = [
+            'cos:',
+            '  base:',
+            `    secretid: ${yamlString(process.env.TENCENT_COS_SECRET_ID)}`,
+            `    secretkey: ${yamlString(process.env.TENCENT_COS_SECRET_KEY)}`,
+            `    sessiontoken: ${yamlString(process.env.TENCENT_COS_SECURITY_TOKEN)}`,
+            '    protocol: https',
+            '  buckets:',
+            `  - name: ${yamlString(process.env.TENCENT_COS_BUCKET)}`,
+            '    alias: release',
+            `    region: ${yamlString(process.env.TENCENT_COS_REGION)}`,
+            `    endpoint: ${yamlString(`cos.${process.env.TENCENT_COS_REGION}.myqcloud.com`)}`,
+            '    ofs: false',
+            '',
+          ].join('\n');
+
+          fs.writeFileSync(configPath, config);
+          fs.appendFileSync(process.env.GITHUB_ENV, `COSCLI_CONFIG_PATH=${configPath}\n`);
+          NODE
+
+      - name: Resolve source bundle keys
+        id: source_keys
+        run: |
+          set -euo pipefail
+
+          source_key="${SOURCE_PREFIX}/${{ matrix.name }}/${SOURCE_ARCHIVE_NAME}"
+          source_sha_key="${SOURCE_PREFIX}/${{ matrix.name }}/${SOURCE_SHA_NAME}"
+          {
+            echo "source_key=${source_key}"
+            echo "source_sha_key=${source_sha_key}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download source bundle from COS
+        id: source
+        env:
+          TENCENT_COS_BUCKET: ${{ vars.TENCENT_COS_BUCKET || secrets.TENCENT_COS_BUCKET }}
+          SOURCE_ARCHIVE: ${{ runner.temp }}/desktop-source.tgz
+          SOURCE_SHA_FILE: ${{ runner.temp }}/desktop-source.sha256
+          SOURCE_KEY: ${{ steps.source_keys.outputs.source_key }}
+          SOURCE_SHA_KEY: ${{ steps.source_keys.outputs.source_sha_key }}
+        run: |
+          set -euo pipefail
+
+          source_archive="${RUNNER_TEMP}/desktop-source.tgz"
+          source_sha_file="${RUNNER_TEMP}/desktop-source.sha256"
+          source_root="${RUNNER_TEMP}/desktop-source"
+
+          coscli cp "cos://${TENCENT_COS_BUCKET}/${SOURCE_KEY}" "$source_archive" -c "$COSCLI_CONFIG_PATH"
+          coscli cp "cos://${TENCENT_COS_BUCKET}/${SOURCE_SHA_KEY}" "$source_sha_file" -c "$COSCLI_CONFIG_PATH"
+
+          node - <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+
+          const archive = process.env.SOURCE_ARCHIVE;
+          const shaFile = process.env.SOURCE_SHA_FILE;
+          const expected = process.env.EXPECTED_SOURCE_SHA256;
+          const declared = fs.readFileSync(shaFile, 'utf8').trim();
+          const actual = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+
+          if (declared !== expected || actual !== expected) {
+            throw new Error('Source bundle checksum mismatch');
+          }
+          NODE
+
+          mkdir -p "$source_root"
+          tar -xzf "$source_archive" -C "$source_root"
+
+          {
+            echo "source_root=${source_root}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Delete source bundle from COS
+        if: always() && steps.source_keys.outputs.source_key != ''
+        env:
+          TENCENT_COS_BUCKET: ${{ vars.TENCENT_COS_BUCKET || secrets.TENCENT_COS_BUCKET }}
+          SOURCE_KEY: ${{ steps.source_keys.outputs.source_key }}
+          SOURCE_SHA_KEY: ${{ steps.source_keys.outputs.source_sha_key }}
+        run: |
+          set +e
+          coscli rm "cos://${TENCENT_COS_BUCKET}/${SOURCE_KEY}" -c "$COSCLI_CONFIG_PATH"
+          coscli rm "cos://${TENCENT_COS_BUCKET}/${SOURCE_SHA_KEY}" -c "$COSCLI_CONFIG_PATH"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+
+      - name: Set up pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.32.1 --activate
+
+      - name: Resolve build environment
+        env:
+          TEST_SERVER_URL_VAR: ${{ vars.APP_SERVER_URL_TEST }}
+          PROD_SERVER_URL_VAR: ${{ vars.APP_SERVER_URL_PROD }}
+          TEST_SERVER_URL_SECRET: ${{ secrets.APP_SERVER_URL_TEST }}
+          PROD_SERVER_URL_SECRET: ${{ secrets.APP_SERVER_URL_PROD }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$CHANNEL" == "prod" ]]; then
+            server_url="${PROD_SERVER_URL_VAR:-${PROD_SERVER_URL_SECRET:-}}"
+          else
+            server_url="${TEST_SERVER_URL_VAR:-${TEST_SERVER_URL_SECRET:-}}"
+          fi
+
+          if [[ -z "$server_url" ]]; then
+            echo "::error::APP_SERVER_URL_${CHANNEL^^} must be configured as a repository variable or secret."
+            exit 1
+          fi
+
+          {
+            echo "DESKTOP_CHANNEL=${CHANNEL}"
+            echo "APP_SERVER_URL=${server_url}"
+            echo "PACKAGE_VERSION=${VERSION}"
+          } >> "$GITHUB_ENV"
+
+      - name: Use HTTPS for GitHub dependencies
+        run: |
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install dependencies
+        working-directory: ${{ steps.source.outputs.source_root }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Stamp desktop package version
+        working-directory: ${{ steps.source.outputs.source_root }}
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const packagePath = 'desktop/package.json';
+          const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+          packageJson.version = process.env.PACKAGE_VERSION;
+          fs.writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+          NODE
+
+      - name: Prepare desktop video runtime
+        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        run: pnpm run prepare:video-runtime --target=${{ matrix.platform }}-${{ matrix.arch }}
+
+      - name: Check desktop video runtime
+        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        run: pnpm run check:video-runtime --target=${{ matrix.platform }}-${{ matrix.arch }}
+
+      - name: Build desktop sources
+        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        run: pnpm run build
+
+      - name: Make desktop package
+        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        run: pnpm exec electron-forge make --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+
+      - name: Upload package files to COS and notify relay
+        working-directory: ${{ steps.source.outputs.source_root }}
+        env:
+          RELAY_WEBHOOK_URL: ${{ secrets.DESKTOP_RELEASE_RELAY_WEBHOOK_URL }}
+          RELAY_TOKEN: ${{ secrets.DESKTOP_RELEASE_RELAY_TOKEN }}
+          TENCENT_COS_BUCKET: ${{ vars.TENCENT_COS_BUCKET || secrets.TENCENT_COS_BUCKET }}
+          TARGET_NAME: ${{ matrix.name }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$RELAY_WEBHOOK_URL" ]]; then
+            echo "::error::DESKTOP_RELEASE_RELAY_WEBHOOK_URL must be configured as a repository secret."
+            exit 1
+          fi
+
+          if [[ -z "$RELAY_TOKEN" ]]; then
+            echo "::error::DESKTOP_RELEASE_RELAY_TOKEN must be configured as a repository secret."
+            exit 1
+          fi
+
+          if [[ -z "${TENCENT_COS_BUCKET:-}" ]]; then
+            echo "::error::TENCENT_COS_BUCKET must be configured as a repository variable or secret."
+            exit 1
+          fi
+
+          node - <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+
+          const env = process.env;
+          const makeRoot = path.resolve('desktop/out/make');
+          const stageRoot = path.join(env.RUNNER_TEMP, 'desktop-release-cos', env.TARGET_NAME);
+          fs.rmSync(stageRoot, { force: true, recursive: true });
+          fs.mkdirSync(stageRoot, { recursive: true });
+
+          function walk(directory) {
+            if (!fs.existsSync(directory)) return [];
+            return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+              const entryPath = path.join(directory, entry.name);
+              if (entry.isDirectory()) return walk(entryPath);
+              return entry.isFile() ? [entryPath] : [];
+            });
+          }
+
+          function packageFiles() {
+            return walk(makeRoot).filter((filePath) => {
+              const name = path.basename(filePath);
+              return name === 'RELEASES' || name.endsWith('.exe') || name.endsWith('.dmg') || name.endsWith('.nupkg');
+            });
+          }
+
+          function requireSingle(files, label) {
+            if (files.length !== 1) {
+              throw new Error(`Expected exactly one ${label} for ${env.TARGET_NAME}, found ${files.length}.`);
+            }
+            return files[0];
+          }
+
+          const prefix = env.PACKAGE_FILE_PREFIX || 'desktop-app';
+          const files = packageFiles();
+          let selected;
+          if (env.TARGET_NAME === 'windows-x64') {
+            const exe = requireSingle(files.filter((file) => file.endsWith('.exe')), 'Windows installer');
+            const nupkgs = files.filter((file) => file.endsWith('.nupkg'));
+            const nupkg = requireSingle(
+              nupkgs.filter((file) => path.basename(file).endsWith('-full.nupkg')).length === 1
+                ? nupkgs.filter((file) => path.basename(file).endsWith('-full.nupkg'))
+                : nupkgs,
+              'Squirrel nupkg',
+            );
+            const releases = requireSingle(files.filter((file) => path.basename(file) === 'RELEASES'), 'Squirrel RELEASES');
+            selected = [
+              { source: exe, name: `${prefix}-${env.VERSION}-windows-x64.exe` },
+              { source: nupkg, name: path.basename(nupkg) },
+              { source: releases, name: 'RELEASES' },
+            ];
+          } else if (env.TARGET_NAME === 'mac-arm64') {
+            selected = [{ source: requireSingle(files.filter((file) => file.endsWith('.dmg')), 'macOS arm64 DMG'), name: `${prefix}-${env.VERSION}-mac-arm64.dmg` }];
+          } else if (env.TARGET_NAME === 'mac-x64') {
+            selected = [{ source: requireSingle(files.filter((file) => file.endsWith('.dmg')), 'macOS x64 DMG'), name: `${prefix}-${env.VERSION}-mac-x64.dmg` }];
+          } else {
+            throw new Error(`Unsupported desktop target: ${env.TARGET_NAME}`);
+          }
+
+          const safeName = /^[A-Za-z0-9._-]+$/;
+          const uploads = selected.map((item) => {
+            if (!safeName.test(item.name)) {
+              throw new Error(`Unsafe release file name: ${item.name}`);
+            }
+            const stagedPath = path.join(stageRoot, item.name);
+            fs.copyFileSync(item.source, stagedPath);
+            const data = fs.readFileSync(stagedPath);
+            return {
+              source: stagedPath,
+              objectKey: `${env.VERSION}/${item.name}`,
+              size: data.length,
+              sha256: crypto.createHash('sha256').update(data).digest('hex'),
+            };
+          });
+
+          for (const upload of uploads) {
+            console.log(`::notice::Uploading ${upload.objectKey} to COS.`);
+            const result = spawnSync(
+              'coscli',
+              ['cp', upload.source, `cos://${env.TENCENT_COS_BUCKET}/${upload.objectKey}`, '-c', env.COSCLI_CONFIG_PATH],
+              { stdio: 'inherit' },
+            );
+            if (result.status !== 0) {
+              throw new Error(`coscli upload failed for ${upload.objectKey}.`);
+            }
+          }
+
+          const report = {
+            repository: env.SOURCE_REPOSITORY,
+            runId: env.SOURCE_RUN_ID,
+            runAttempt: env.SOURCE_RUN_ATTEMPT,
+            runUrl: env.SOURCE_RUN_URL,
+            sha: env.SOURCE_SHA,
+            refName: env.SOURCE_REF_NAME,
+            channel: env.CHANNEL,
+            version: env.VERSION,
+            target: env.TARGET_NAME,
+            platform: env.PLATFORM,
+            arch: env.ARCH,
+            files: uploads.map(({ objectKey, size, sha256 }) => ({ objectKey, size, sha256 })),
+          };
+
+          (async () => {
+            const response = await fetch(env.RELAY_WEBHOOK_URL, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${env.RELAY_TOKEN}`,
+                'content-type': 'application/json',
+              },
+              body: JSON.stringify(report),
+            });
+            const responseText = await response.text();
+            if (!response.ok) {
+              throw new Error(`Relay webhook failed: ${response.status} ${responseText.slice(0, 500)}`);
+            }
+            console.log(`::notice::Relay accepted ${env.TARGET_NAME}: ${responseText.trim()}`);
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
