@@ -39,16 +39,16 @@ jobs:
     env:
       CHANNEL: ${{ github.event.client_payload.channel }}
       VERSION: ${{ github.event.client_payload.version }}
-      SOURCE_PREFIX: ${{ github.event.client_payload.sourcePrefix }}
-      SOURCE_ARCHIVE_NAME: ${{ github.event.client_payload.sourceArchiveName }}
-      SOURCE_SHA_NAME: ${{ github.event.client_payload.sourceShaName }}
-      EXPECTED_SOURCE_SHA256: ${{ github.event.client_payload.sourceSha256 }}
-      SOURCE_REPOSITORY: ${{ github.event.client_payload.sourceRepository }}
-      SOURCE_RUN_ID: ${{ github.event.client_payload.runId }}
-      SOURCE_RUN_ATTEMPT: ${{ github.event.client_payload.runAttempt }}
-      SOURCE_RUN_URL: ${{ github.event.client_payload.runUrl }}
-      SOURCE_SHA: ${{ github.event.client_payload.sha }}
-      SOURCE_REF_NAME: ${{ github.event.client_payload.refName }}
+      SOURCE_PREFIX: ${{ github.event.client_payload.source.prefix }}
+      SOURCE_ARCHIVE_NAME: ${{ github.event.client_payload.source.archiveName }}
+      SOURCE_SHA_NAME: ${{ github.event.client_payload.source.shaName }}
+      EXPECTED_SOURCE_SHA256: ${{ github.event.client_payload.source.sha256 }}
+      SOURCE_REPOSITORY: ${{ github.event.client_payload.origin.repository }}
+      SOURCE_RUN_ID: ${{ github.event.client_payload.origin.runId }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.client_payload.origin.runAttempt }}
+      SOURCE_RUN_URL: ${{ github.event.client_payload.origin.runUrl }}
+      SOURCE_SHA: ${{ github.event.client_payload.origin.sha }}
+      SOURCE_REF_NAME: ${{ github.event.client_payload.origin.refName }}
       PACKAGE_FILE_PREFIX: ${{ github.event.client_payload.packageFilePrefix || 'desktop-app' }}
     steps:
       - name: Validate dispatch payload
