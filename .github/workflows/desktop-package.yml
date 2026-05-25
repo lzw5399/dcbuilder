@@ -277,6 +277,72 @@ jobs:
           fs.writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
           NODE
 
+      - name: Import Apple signing credentials
+        if: ${{ matrix.platform == 'darwin' }}
+        env:
+          MAC_CERTIFICATE_P12_BASE64: ${{ secrets.MAC_CERTIFICATE_P12_BASE64 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          DCOIN_MAC_CODESIGN_IDENTITY: ${{ secrets.DCOIN_MAC_CODESIGN_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+
+          for name in \
+            MAC_CERTIFICATE_P12_BASE64 \
+            MAC_CERTIFICATE_PASSWORD \
+            DCOIN_MAC_CODESIGN_IDENTITY \
+            APPLE_TEAM_ID \
+            APPLE_API_KEY_BASE64 \
+            APPLE_API_KEY_ID \
+            APPLE_API_ISSUER
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::${name} must be configured for signed macOS packages."
+              exit 1
+            fi
+          done
+
+          if [[ "$DCOIN_MAC_CODESIGN_IDENTITY" != *"(${APPLE_TEAM_ID})"* ]]; then
+            echo "::error::DCOIN_MAC_CODESIGN_IDENTITY must include APPLE_TEAM_ID in parentheses."
+            exit 1
+          fi
+
+          keychain_password="$(openssl rand -hex 24)"
+          keychain_path="${RUNNER_TEMP}/dcoin-mac-signing.keychain-db"
+          certificate_path="${RUNNER_TEMP}/developer-id-application.p12"
+          notary_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+
+          printf '%s' "$MAC_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 -D > "$notary_key_path"
+          chmod 600 "$certificate_path" "$notary_key_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$MAC_CERTIFICATE_PASSWORD" \
+            -t cert \
+            -f pkcs12 \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path"
+
+          {
+            echo "DCOIN_MAC_CODESIGN_IDENTITY=${DCOIN_MAC_CODESIGN_IDENTITY}"
+            echo "DCOIN_MAC_CODESIGN_KEYCHAIN=${keychain_path}"
+            echo "DCOIN_MAC_NOTARIZE=true"
+            echo "APPLE_API_KEY_PATH=${notary_key_path}"
+            echo "APPLE_API_KEY_ID=${APPLE_API_KEY_ID}"
+            echo "APPLE_API_ISSUER=${APPLE_API_ISSUER}"
+          } >> "$GITHUB_ENV"
+
       - name: Prepare desktop video runtime
         working-directory: ${{ steps.source.outputs.source_root }}/desktop
         run: pnpm run prepare:video-runtime --target=${{ matrix.platform }}-${{ matrix.arch }}
@@ -292,6 +358,40 @@ jobs:
       - name: Make desktop package
         working-directory: ${{ steps.source.outputs.source_root }}/desktop
         run: pnpm exec electron-forge make --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+
+      - name: Notarize and verify macOS package
+        if: ${{ matrix.platform == 'darwin' }}
+        working-directory: ${{ steps.source.outputs.source_root }}
+        run: |
+          set -euo pipefail
+
+          app_path="$(find desktop/out -maxdepth 3 -type d -name '都可赢.app' -print -quit)"
+          if [[ -z "$app_path" || ! -d "$app_path" ]]; then
+            echo "::error::Packaged macOS app was not found."
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          xcrun stapler validate "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+
+          dmg_count=0
+          while IFS= read -r -d '' dmg_path; do
+            dmg_count=$((dmg_count + 1))
+            xcrun notarytool submit "$dmg_path" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              --wait
+            xcrun stapler staple "$dmg_path"
+            xcrun stapler validate "$dmg_path"
+            spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+          done < <(find desktop/out/make -type f -name '*.dmg' -print0)
+
+          if [[ "$dmg_count" -eq 0 ]]; then
+            echo "::error::No DMG artifacts were produced."
+            exit 1
+          fi
 
       - name: Upload package files to COS and notify relay
         working-directory: ${{ steps.source.outputs.source_root }}
@@ -443,6 +543,21 @@ jobs:
             process.exit(1);
           });
           NODE
+
+      - name: Delete Apple signing credentials
+        if: ${{ always() && matrix.platform == 'darwin' }}
+        run: |
+          set +e
+
+          rm -f "${RUNNER_TEMP}/developer-id-application.p12"
+          rm -f "${APPLE_API_KEY_PATH:-${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID:-}.p8}"
+
+          keychain_path="${DCOIN_MAC_CODESIGN_KEYCHAIN:-${RUNNER_TEMP}/dcoin-mac-signing.keychain-db}"
+          if [[ -n "$keychain_path" ]]; then
+            security delete-keychain "$keychain_path" || true
+          fi
+
+          exit 0
 
   cleanup:
     name: Delete source bundles from COS
