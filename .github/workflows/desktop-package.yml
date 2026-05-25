@@ -337,7 +337,6 @@ jobs:
           {
             echo "DCOIN_MAC_CODESIGN_IDENTITY=${DCOIN_MAC_CODESIGN_IDENTITY}"
             echo "DCOIN_MAC_CODESIGN_KEYCHAIN=${keychain_path}"
-            echo "DCOIN_MAC_NOTARIZE=true"
             echo "APPLE_API_KEY_PATH=${notary_key_path}"
             echo "APPLE_API_KEY_ID=${APPLE_API_KEY_ID}"
             echo "APPLE_API_ISSUER=${APPLE_API_ISSUER}"
@@ -356,10 +355,50 @@ jobs:
         run: pnpm run build
 
       - name: Make desktop package
+        if: ${{ matrix.platform != 'darwin' }}
         working-directory: ${{ steps.source.outputs.source_root }}/desktop
         run: pnpm exec electron-forge make --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
 
-      - name: Notarize and verify macOS package
+      - name: Package macOS app
+        if: ${{ matrix.platform == 'darwin' }}
+        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        run: pnpm exec electron-forge package --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+
+      - name: Notarize macOS app
+        if: ${{ matrix.platform == 'darwin' }}
+        working-directory: ${{ steps.source.outputs.source_root }}
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          app_path="$(find desktop/out -maxdepth 3 -type d -name '都可赢.app' -print -quit)"
+          if [[ -z "$app_path" || ! -d "$app_path" ]]; then
+            echo "::error::Packaged macOS app was not found."
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
+          app_zip="${RUNNER_TEMP}/dcoin-app-${TARGET_ARCH}.zip"
+          rm -f "$app_zip"
+          ditto -c -k --keepParent "$app_path" "$app_zip"
+
+          xcrun notarytool submit "$app_zip" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$app_path"
+          xcrun stapler validate "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+
+      - name: Make macOS DMG
+        if: ${{ matrix.platform == 'darwin' }}
+        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        run: pnpm exec electron-forge make --skip-package --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+
+      - name: Notarize and verify macOS DMG
         if: ${{ matrix.platform == 'darwin' }}
         working-directory: ${{ steps.source.outputs.source_root }}
         run: |
