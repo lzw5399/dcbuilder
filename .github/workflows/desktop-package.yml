@@ -342,6 +342,100 @@ jobs:
             echo "APPLE_API_ISSUER=${APPLE_API_ISSUER}"
           } >> "$GITHUB_ENV"
 
+      - name: Write macOS notarization helper
+        if: ${{ matrix.platform == 'darwin' }}
+        run: |
+          set -euo pipefail
+
+          helper_path="${RUNNER_TEMP}/notarize-with-retry.sh"
+          cat > "$helper_path" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          artifact_path="${1:?missing artifact path}"
+          artifact_label="${2:-artifact}"
+          max_wait_seconds="${DCOIN_NOTARY_MAX_WAIT_SECONDS:-7200}"
+          poll_interval_seconds="${DCOIN_NOTARY_POLL_INTERVAL_SECONDS:-60}"
+          submit_json="$(mktemp "${RUNNER_TEMP}/notary-submit.XXXXXX")"
+          submit_error="$(mktemp "${RUNNER_TEMP}/notary-submit-error.XXXXXX")"
+
+          echo "::notice::Submitting ${artifact_label} to Apple notary service."
+          submit_attempt=1
+          until xcrun notarytool submit "$artifact_path" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --output-format json > "$submit_json" 2> "$submit_error"; do
+            if [[ "$submit_attempt" -ge 3 ]]; then
+              echo "::error::Failed to submit ${artifact_label} to Apple notary service after ${submit_attempt} attempts."
+              cat "$submit_error"
+              exit 1
+            fi
+
+            echo "::warning::Apple notary submit failed for ${artifact_label}; retrying in 60 seconds."
+            cat "$submit_error"
+            submit_attempt=$((submit_attempt + 1))
+            sleep 60
+          done
+
+          submission_id="$(node -e "const fs = require('node:fs'); const data = JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); process.stdout.write(data.id || data.submissionId || '');" "$submit_json")"
+          if [[ -z "$submission_id" ]]; then
+            echo "::error::Apple notary submission id was missing for ${artifact_label}."
+            cat "$submit_json"
+            exit 1
+          fi
+
+          echo "::notice::Apple notary submission id for ${artifact_label}: ${submission_id}"
+          deadline=$((SECONDS + max_wait_seconds))
+          while (( SECONDS < deadline )); do
+            info_json="$(mktemp "${RUNNER_TEMP}/notary-info.XXXXXX")"
+            info_error="$(mktemp "${RUNNER_TEMP}/notary-info-error.XXXXXX")"
+
+            if xcrun notarytool info "$submission_id" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              --output-format json > "$info_json" 2> "$info_error"; then
+              status="$(node -e "const fs = require('node:fs'); const data = JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); process.stdout.write(data.status || '');" "$info_json")"
+              echo "::notice::Apple notary status for ${artifact_label}: ${status}"
+
+              case "$status" in
+                Accepted)
+                  exit 0
+                  ;;
+                Invalid|Rejected)
+                  echo "::error::Apple notary rejected ${artifact_label} with status ${status}."
+                  log_path="${RUNNER_TEMP}/notary-log-${submission_id}.json"
+                  if xcrun notarytool log "$submission_id" "$log_path" \
+                    --key "$APPLE_API_KEY_PATH" \
+                    --key-id "$APPLE_API_KEY_ID" \
+                    --issuer "$APPLE_API_ISSUER"; then
+                    cat "$log_path"
+                  fi
+                  exit 1
+                  ;;
+              esac
+            else
+              echo "::warning::Apple notary status check failed for ${artifact_label}; continuing to poll."
+              cat "$info_error"
+            fi
+
+            sleep "$poll_interval_seconds"
+          done
+
+          echo "::error::Timed out waiting for Apple notary result for ${artifact_label} after ${max_wait_seconds} seconds."
+          log_path="${RUNNER_TEMP}/notary-log-${submission_id}.json"
+          if xcrun notarytool log "$submission_id" "$log_path" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER"; then
+            cat "$log_path"
+          fi
+          exit 1
+          BASH
+          chmod +x "$helper_path"
+          echo "DCOIN_NOTARY_HELPER=${helper_path}" >> "$GITHUB_ENV"
+
       - name: Prepare desktop video runtime
         working-directory: ${{ steps.source.outputs.source_root }}/desktop
         run: pnpm run prepare:video-runtime --target=${{ matrix.platform }}-${{ matrix.arch }}
@@ -364,11 +458,9 @@ jobs:
         working-directory: ${{ steps.source.outputs.source_root }}/desktop
         run: pnpm exec electron-forge package --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
 
-      - name: Notarize macOS app
+      - name: Verify macOS app signature
         if: ${{ matrix.platform == 'darwin' }}
         working-directory: ${{ steps.source.outputs.source_root }}
-        env:
-          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
 
@@ -379,19 +471,6 @@ jobs:
           fi
 
           codesign --verify --deep --strict --verbose=2 "$app_path"
-
-          app_zip="${RUNNER_TEMP}/dcoin-app-${TARGET_ARCH}.zip"
-          rm -f "$app_zip"
-          ditto -c -k --keepParent "$app_path" "$app_zip"
-
-          xcrun notarytool submit "$app_zip" \
-            --key "$APPLE_API_KEY_PATH" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER" \
-            --wait
-          xcrun stapler staple "$app_path"
-          xcrun stapler validate "$app_path"
-          spctl --assess --type execute --verbose=4 "$app_path"
 
       - name: Make macOS DMG
         if: ${{ matrix.platform == 'darwin' }}
@@ -411,17 +490,11 @@ jobs:
           fi
 
           codesign --verify --deep --strict --verbose=2 "$app_path"
-          xcrun stapler validate "$app_path"
-          spctl --assess --type execute --verbose=4 "$app_path"
 
           dmg_count=0
           while IFS= read -r -d '' dmg_path; do
             dmg_count=$((dmg_count + 1))
-            xcrun notarytool submit "$dmg_path" \
-              --key "$APPLE_API_KEY_PATH" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER" \
-              --wait
+            "$DCOIN_NOTARY_HELPER" "$dmg_path" "macOS DMG $(basename "$dmg_path")"
             xcrun stapler staple "$dmg_path"
             xcrun stapler validate "$dmg_path"
             spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
