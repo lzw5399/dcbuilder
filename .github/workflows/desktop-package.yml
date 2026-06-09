@@ -271,26 +271,26 @@ jobs:
         run: |
           node - <<'NODE'
           const fs = require('node:fs');
-          const packagePath = 'desktop/package.json';
+          const packagePath = 'src/desktop/package.json';
           const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
           packageJson.version = process.env.PACKAGE_VERSION;
           fs.writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
           NODE
 
       - name: Prepare desktop video runtime
-        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        working-directory: ${{ steps.source.outputs.source_root }}/src/desktop
         run: pnpm run prepare:video-runtime --target=${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Check desktop video runtime
-        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        working-directory: ${{ steps.source.outputs.source_root }}/src/desktop
         run: pnpm run check:video-runtime --target=${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Build desktop sources
-        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        working-directory: ${{ steps.source.outputs.source_root }}/src/desktop
         run: pnpm run build
 
       - name: Make desktop package
-        working-directory: ${{ steps.source.outputs.source_root }}/desktop
+        working-directory: ${{ steps.source.outputs.source_root }}/src/desktop
         run: pnpm exec electron-forge make --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
 
       - name: Upload package files to COS and notify relay
@@ -327,7 +327,7 @@ jobs:
           const { spawnSync } = require('node:child_process');
 
           const env = process.env;
-          const makeRoot = path.resolve('desktop/out/make');
+          const makeRoot = path.resolve('src/desktop/out/make');
           const stageRoot = path.join(env.RUNNER_TEMP, 'desktop-release-cos', env.TARGET_NAME);
           fs.rmSync(stageRoot, { force: true, recursive: true });
           fs.mkdirSync(stageRoot, { recursive: true });
