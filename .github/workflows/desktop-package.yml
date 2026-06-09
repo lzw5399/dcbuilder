@@ -50,6 +50,7 @@ jobs:
       SOURCE_SHA: ${{ github.event.client_payload.origin.sha }}
       SOURCE_REF_NAME: ${{ github.event.client_payload.origin.refName }}
       PACKAGE_FILE_PREFIX: ${{ github.event.client_payload.packageFilePrefix || 'desktop-app' }}
+      DESKTOP_RELEASE_PUBLIC_BASE_URL: ${{ github.event.client_payload.releaseBaseUrl || 'https://asset.dcoin-ai.com' }}
     steps:
       - name: Validate dispatch payload
         run: |
@@ -89,6 +90,14 @@ jobs:
           }
           if (!/^[A-Za-z0-9._-]+$/.test(env.PACKAGE_FILE_PREFIX)) {
             throw new Error('Invalid package file prefix');
+          }
+          try {
+            const url = new URL(env.DESKTOP_RELEASE_PUBLIC_BASE_URL);
+            if (url.protocol !== 'https:') {
+              throw new Error('Desktop release public base URL must use HTTPS');
+            }
+          } catch (error) {
+            throw new Error(`Invalid desktop release public base URL: ${error.message}`);
           }
           NODE
 
@@ -344,7 +353,7 @@ jobs:
           function packageFiles() {
             return walk(makeRoot).filter((filePath) => {
               const name = path.basename(filePath);
-              return name === 'RELEASES' || name.endsWith('.exe') || name.endsWith('.dmg') || name.endsWith('.nupkg');
+              return name === 'RELEASES' || name === 'RELEASES.json' || name.endsWith('.exe') || name.endsWith('.dmg') || name.endsWith('.zip') || name.endsWith('.nupkg');
             });
           }
 
@@ -356,6 +365,7 @@ jobs:
           }
 
           const prefix = env.PACKAGE_FILE_PREFIX || 'desktop-app';
+          const releaseBaseUrl = env.DESKTOP_RELEASE_PUBLIC_BASE_URL.replace(/\/+$/, '');
           const files = packageFiles();
           let selected;
           if (env.TARGET_NAME === 'windows-x64') {
@@ -374,24 +384,77 @@ jobs:
               { source: releases, name: 'RELEASES' },
             ];
           } else if (env.TARGET_NAME === 'mac-arm64') {
-            selected = [{ source: requireSingle(files.filter((file) => file.endsWith('.dmg')), 'macOS arm64 DMG'), name: `${prefix}-${env.VERSION}-mac-arm64.dmg` }];
+            const zipName = `${prefix}-${env.VERSION}-mac-arm64.zip`;
+            selected = [
+              {
+                source: requireSingle(files.filter((file) => file.endsWith('.dmg')), 'macOS arm64 DMG'),
+                name: `${prefix}-${env.VERSION}-mac-arm64.dmg`,
+                objectKey: `${env.VERSION}/${env.TARGET_NAME}/${prefix}-${env.VERSION}-mac-arm64.dmg`,
+              },
+              {
+                source: requireSingle(files.filter((file) => file.endsWith('.zip')), 'macOS arm64 ZIP'),
+                name: zipName,
+                objectKey: `${env.VERSION}/${env.TARGET_NAME}/${zipName}`,
+              },
+              {
+                source: requireSingle(files.filter((file) => path.basename(file) === 'RELEASES.json'), 'macOS arm64 RELEASES.json'),
+                name: 'RELEASES.json',
+                objectKey: `${env.VERSION}/${env.TARGET_NAME}/RELEASES.json`,
+                macZipName: zipName,
+              },
+            ];
           } else if (env.TARGET_NAME === 'mac-x64') {
-            selected = [{ source: requireSingle(files.filter((file) => file.endsWith('.dmg')), 'macOS x64 DMG'), name: `${prefix}-${env.VERSION}-mac-x64.dmg` }];
+            const zipName = `${prefix}-${env.VERSION}-mac-x64.zip`;
+            selected = [
+              {
+                source: requireSingle(files.filter((file) => file.endsWith('.dmg')), 'macOS x64 DMG'),
+                name: `${prefix}-${env.VERSION}-mac-x64.dmg`,
+                objectKey: `${env.VERSION}/${env.TARGET_NAME}/${prefix}-${env.VERSION}-mac-x64.dmg`,
+              },
+              {
+                source: requireSingle(files.filter((file) => file.endsWith('.zip')), 'macOS x64 ZIP'),
+                name: zipName,
+                objectKey: `${env.VERSION}/${env.TARGET_NAME}/${zipName}`,
+              },
+              {
+                source: requireSingle(files.filter((file) => path.basename(file) === 'RELEASES.json'), 'macOS x64 RELEASES.json'),
+                name: 'RELEASES.json',
+                objectKey: `${env.VERSION}/${env.TARGET_NAME}/RELEASES.json`,
+                macZipName: zipName,
+              },
+            ];
           } else {
             throw new Error(`Unsupported desktop target: ${env.TARGET_NAME}`);
           }
 
           const safeName = /^[A-Za-z0-9._-]+$/;
+          const safeObjectKey = /^[A-Za-z0-9._/-]+$/;
           const uploads = selected.map((item) => {
             if (!safeName.test(item.name)) {
               throw new Error(`Unsafe release file name: ${item.name}`);
             }
+            const objectKey = item.objectKey || `${env.VERSION}/${item.name}`;
+            if (!safeObjectKey.test(objectKey) || objectKey.includes('//') || objectKey.split('/').includes('..')) {
+              throw new Error(`Unsafe release object key: ${objectKey}`);
+            }
             const stagedPath = path.join(stageRoot, item.name);
-            fs.copyFileSync(item.source, stagedPath);
+            if (item.macZipName) {
+              const manifest = JSON.parse(fs.readFileSync(item.source, 'utf8'));
+              const currentRelease = Array.isArray(manifest.releases)
+                ? manifest.releases.find((release) => release && release.version === env.VERSION)
+                : undefined;
+              if (!currentRelease?.updateTo) {
+                throw new Error(`RELEASES.json does not contain the current macOS release ${env.VERSION}.`);
+              }
+              currentRelease.updateTo.url = `${releaseBaseUrl}/${encodeURIComponent(env.VERSION)}/${env.TARGET_NAME}/${item.macZipName}`;
+              fs.writeFileSync(stagedPath, `${JSON.stringify(manifest, null, 2)}\n`);
+            } else {
+              fs.copyFileSync(item.source, stagedPath);
+            }
             const data = fs.readFileSync(stagedPath);
             return {
               source: stagedPath,
-              objectKey: `${env.VERSION}/${item.name}`,
+              objectKey,
               size: data.length,
               sha256: crypto.createHash('sha256').update(data).digest('hex'),
             };
