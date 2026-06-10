@@ -20,6 +20,7 @@ jobs:
   make:
     name: Make ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -298,9 +299,219 @@ jobs:
         working-directory: ${{ steps.source.outputs.source_root }}/src/desktop
         run: pnpm run build
 
+      - name: Prepare macOS signing and notarization credentials
+        if: ${{ matrix.platform == 'darwin' }}
+        env:
+          MAC_CERTIFICATE_P12_BASE64: ${{ secrets.MAC_CERTIFICATE_P12_BASE64 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          DCOIN_MAC_CODESIGN_IDENTITY: ${{ secrets.DCOIN_MAC_CODESIGN_IDENTITY }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+
+          for name in \
+            MAC_CERTIFICATE_P12_BASE64 \
+            MAC_CERTIFICATE_PASSWORD \
+            DCOIN_MAC_CODESIGN_IDENTITY \
+            APPLE_API_KEY_BASE64 \
+            APPLE_API_KEY_ID \
+            APPLE_API_ISSUER; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::${name} must be configured for macOS Developer ID signing and notarization."
+              exit 1
+            fi
+          done
+
+          keychain_path="${RUNNER_TEMP}/dcoin-macos-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_path="${RUNNER_TEMP}/dcoin-macos-certificate.p12"
+          notary_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+
+          MAC_CERTIFICATE_PATH="$certificate_path" NOTARY_KEY_PATH="$notary_key_path" node - <<'NODE'
+          const fs = require('node:fs');
+
+          fs.writeFileSync(process.env.MAC_CERTIFICATE_PATH, Buffer.from(process.env.MAC_CERTIFICATE_P12_BASE64, 'base64'));
+          fs.writeFileSync(process.env.NOTARY_KEY_PATH, Buffer.from(process.env.APPLE_API_KEY_BASE64, 'base64'));
+          NODE
+          chmod 600 "$certificate_path" "$notary_key_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+
+          existing_keychains=()
+          while IFS= read -r keychain; do
+            keychain="${keychain//\"/}"
+            keychain="${keychain#"${keychain%%[![:space:]]*}"}"
+            keychain="${keychain%"${keychain##*[![:space:]]}"}"
+            if [[ -n "$keychain" ]]; then
+              existing_keychains+=("$keychain")
+            fi
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain_path" "${existing_keychains[@]}"
+
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$MAC_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+
+          if ! security find-identity -v -p codesigning "$keychain_path" | grep -F -q "$DCOIN_MAC_CODESIGN_IDENTITY"; then
+            echo "::error::DCOIN_MAC_CODESIGN_IDENTITY was not found in the imported certificate."
+            exit 1
+          fi
+
+          {
+            echo "DCOIN_MAC_SIGN=true"
+            echo "DCOIN_MAC_CODESIGN_IDENTITY=${DCOIN_MAC_CODESIGN_IDENTITY}"
+            echo "DCOIN_MAC_CODESIGN_KEYCHAIN=${keychain_path}"
+            echo "DCOIN_MAC_NOTARIZE=false"
+            echo "APPLE_API_KEY_PATH=${notary_key_path}"
+            echo "APPLE_API_KEY_ID=${APPLE_API_KEY_ID}"
+            echo "APPLE_API_ISSUER=${APPLE_API_ISSUER}"
+          } >> "$GITHUB_ENV"
+
       - name: Make desktop package
         working-directory: ${{ steps.source.outputs.source_root }}/src/desktop
         run: pnpm exec electron-forge make --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+
+      - name: Verify macOS Developer ID signature
+        if: ${{ matrix.platform == 'darwin' }}
+        working-directory: ${{ steps.source.outputs.source_root }}
+        env:
+          TARGET_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+
+          app_list="${RUNNER_TEMP}/dcoin-${TARGET_NAME}-apps.txt"
+          signature_log="${RUNNER_TEMP}/dcoin-${TARGET_NAME}-codesign.txt"
+          find src/desktop/out -maxdepth 2 -type d -name '*.app' | sort > "$app_list"
+          app_count="$(wc -l < "$app_list" | tr -d '[:space:]')"
+          if [[ "$app_count" != "1" ]]; then
+            echo "::error::Expected exactly one top-level macOS app bundle for ${TARGET_NAME}, found ${app_count}."
+            cat "$app_list"
+            exit 1
+          fi
+
+          app_path="$(sed -n '1p' "$app_list")"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          codesign -dv --verbose=4 "$app_path" > "$signature_log" 2>&1
+
+          if ! grep -q 'Authority=Developer ID Application' "$signature_log"; then
+            echo "::error::macOS app is not signed with a Developer ID Application identity."
+            exit 1
+          fi
+          if ! grep -Eq '^TeamIdentifier=[A-Z0-9]+' "$signature_log"; then
+            echo "::error::macOS app signature is missing TeamIdentifier."
+            exit 1
+          fi
+          if grep -q 'Signature=adhoc' "$signature_log"; then
+            echo "::error::macOS app still uses ad-hoc signing."
+            exit 1
+          fi
+          echo "::notice::macOS Developer ID signature verified for ${TARGET_NAME}."
+
+      - name: Notarize and staple macOS DMG
+        if: ${{ matrix.platform == 'darwin' }}
+        timeout-minutes: 330
+        working-directory: ${{ steps.source.outputs.source_root }}
+        env:
+          TARGET_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+
+          dmg_list="${RUNNER_TEMP}/dcoin-${TARGET_NAME}-dmgs.txt"
+          submit_json="${RUNNER_TEMP}/dcoin-notary-${TARGET_NAME}-submit.json"
+          info_json="${RUNNER_TEMP}/dcoin-notary-${TARGET_NAME}-info.json"
+          log_json="${RUNNER_TEMP}/dcoin-notary-${TARGET_NAME}-log.json"
+
+          find src/desktop/out/make -type f -name '*.dmg' | sort > "$dmg_list"
+          dmg_count="$(wc -l < "$dmg_list" | tr -d '[:space:]')"
+          if [[ "$dmg_count" != "1" ]]; then
+            echo "::error::Expected exactly one macOS DMG for ${TARGET_NAME}, found ${dmg_count}."
+            cat "$dmg_list"
+            exit 1
+          fi
+
+          dmg_path="$(sed -n '1p' "$dmg_list")"
+          echo "::notice::Submitting ${dmg_path} to Apple Notary."
+          xcrun notarytool submit "$dmg_path" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --output-format json \
+            --no-progress > "$submit_json"
+
+          submission_id="$(SUBMIT_JSON="$submit_json" node - <<'NODE'
+          const fs = require('node:fs');
+          const result = JSON.parse(fs.readFileSync(process.env.SUBMIT_JSON, 'utf8'));
+          if (!result.id) {
+            throw new Error(`Apple Notary submit response did not include an id: ${JSON.stringify(result)}`);
+          }
+          process.stdout.write(result.id);
+          NODE
+          )"
+          echo "::notice::Apple Notary submission id for ${TARGET_NAME}: ${submission_id}"
+
+          deadline=$((SECONDS + 5 * 60 * 60))
+          status=""
+          while (( SECONDS < deadline )); do
+            xcrun notarytool info "$submission_id" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              --output-format json > "$info_json"
+            status="$(INFO_JSON="$info_json" node - <<'NODE'
+          const fs = require('node:fs');
+          const result = JSON.parse(fs.readFileSync(process.env.INFO_JSON, 'utf8'));
+          process.stdout.write(result.status || '');
+          NODE
+            )"
+            echo "::notice::Apple Notary status for ${TARGET_NAME} (${submission_id}): ${status}"
+
+            if [[ "$status" == "Accepted" ]]; then
+              break
+            fi
+            if [[ "$status" == "Invalid" || "$status" == "Rejected" ]]; then
+              xcrun notarytool log "$submission_id" \
+                --key "$APPLE_API_KEY_PATH" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER" \
+                "$log_json" || true
+              if [[ -f "$log_json" ]]; then
+                cat "$log_json"
+              fi
+              echo "::error::Apple Notary rejected ${TARGET_NAME}; release was not uploaded or reported."
+              exit 1
+            fi
+
+            sleep 180
+          done
+
+          if [[ "$status" != "Accepted" ]]; then
+            xcrun notarytool log "$submission_id" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              "$log_json" || true
+            if [[ -f "$log_json" ]]; then
+              cat "$log_json"
+            fi
+            echo "::error::Timed out waiting for Apple Notary result for ${TARGET_NAME} (${submission_id}). The release was not uploaded or reported."
+            exit 1
+          fi
+
+          xcrun notarytool log "$submission_id" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            "$log_json"
+          cat "$log_json"
+          xcrun stapler staple "$dmg_path"
+          xcrun stapler validate "$dmg_path"
 
       - name: Upload package files to COS and notify relay
         working-directory: ${{ steps.source.outputs.source_root }}
@@ -506,6 +717,19 @@ jobs:
             process.exit(1);
           });
           NODE
+
+      - name: Clean up macOS signing credentials
+        if: ${{ always() && matrix.platform == 'darwin' }}
+        run: |
+          set +e
+
+          if [[ -n "${DCOIN_MAC_CODESIGN_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$DCOIN_MAC_CODESIGN_KEYCHAIN"
+          fi
+          if [[ -n "${APPLE_API_KEY_PATH:-}" ]]; then
+            rm -f "$APPLE_API_KEY_PATH"
+          fi
+          rm -f "${RUNNER_TEMP}/dcoin-macos-certificate.p12"
 
   cleanup:
     name: Delete source bundles from COS
